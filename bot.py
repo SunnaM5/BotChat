@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 import json
 from pathlib import Path
+import re
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery
@@ -16,8 +17,16 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 
+# ВАЖНО: сюда пишите без @ (например: dunya_jewellryad)
+MANAGER_USERNAME = (os.getenv("MANAGER_USERNAME", "") or "").strip().lstrip("@")
+MANAGER_CHANNEL = (os.getenv("MANAGER_CHANNEL", "dunya_jewellry") or "").strip()
+MANAGER_PHONE = (os.getenv("MANAGER_PHONE", "") or "").strip()  # опционально
+
 if not BOT_TOKEN or not ADMIN_CHAT_ID:
     raise SystemExit("Заполните BOT_TOKEN и ADMIN_CHAT_ID в .env")
+
+if not MANAGER_USERNAME:
+    raise SystemExit("Заполните MANAGER_USERNAME в .env (без @)")
 
 # ====== ТОВАРЫ ======
 @dataclass
@@ -31,6 +40,8 @@ class Product:
 DATA_FILE = Path(__file__).with_name("products.json")
 
 def load_products() -> Dict[str, Product]:
+    if not DATA_FILE.exists():
+        raise SystemExit("Нет файла products.json рядом с bot.py")
     raw = json.loads(DATA_FILE.read_text(encoding="utf-8"))
     out: Dict[str, Product] = {}
     for item in raw:
@@ -47,10 +58,37 @@ def load_products() -> Dict[str, Product]:
 PRODUCTS: Dict[str, Product] = load_products()
 SIZES = [15, 16, 17, 18, 19]
 
-# ====== ПАМЯТЬ (без базы) ======
+# ====== ПАМЯТЬ ======
 cart: Dict[int, List[dict]] = {}
-checkout_state: Dict[int, dict] = {}
+checkout_state: Dict[int, dict] = {}  # {uid: {"step":..., "data":..., "selected_sizes":...}}
 
+# ====== УТИЛИТЫ ======
+def normalize_phone(raw: str) -> Optional[str]:
+    """
+    Приводит телефон к виду +998901234567
+    Возвращает None, если мусор.
+    """
+    if not raw:
+        return None
+    s = raw.strip()
+    s = re.sub(r"[^\d+]", "", s)
+
+    if s.startswith("998"):
+        s = "+" + s
+
+    digits = re.sub(r"\D", "", s)
+    if digits.startswith("998") and len(digits) == 12:
+        return "+" + digits
+
+    if re.fullmatch(r"\+998\d{9}", s):
+        return s
+
+    if s.startswith("+") and len(re.sub(r"\D", "", s)) >= 7:
+        return s
+
+    return None
+
+# ====== КЛАВИАТУРЫ ======
 def main_menu_kb():
     kb = ReplyKeyboardBuilder()
     kb.button(text="🛍 Каталог")
@@ -83,11 +121,12 @@ def product_kb(product_id: str):
 def cart_kb(user_id: int):
     kb = InlineKeyboardBuilder()
     items = cart.get(user_id, [])
-    for i, it in enumerate(items):
+    for i, _it in enumerate(items):
         kb.button(text=f"➕ {i+1}", callback_data=f"inc:{i}")
         kb.button(text=f"➖ {i+1}", callback_data=f"dec:{i}")
         kb.button(text=f"🗑 {i+1}", callback_data=f"del:{i}")
         kb.adjust(3)
+
     if items:
         kb.row()
         kb.button(text="✅ Оформить заказ", callback_data="checkout:start")
@@ -95,6 +134,29 @@ def cart_kb(user_id: int):
         kb.adjust(2)
     return kb.as_markup()
 
+def contact_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✉️ Написать менеджеру", url=f"https://t.me/{MANAGER_USERNAME}")
+    if MANAGER_CHANNEL:
+        kb.button(text="📣 Канал", url=f"https://t.me/{MANAGER_CHANNEL.lstrip('@')}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def after_order_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✉️ Написать менеджеру", url=f"https://t.me/{MANAGER_USERNAME}")
+    kb.button(text="🛍 В каталог", callback_data="go:catalog")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def admin_contact_kb(username: Optional[str]):
+    if not username:
+        return None
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✉️ Написать клиенту", url=f"https://t.me/{username}")
+    return kb.as_markup()
+
+# ====== КОРЗИНА ======
 def format_cart(user_id: int) -> str:
     items = cart.get(user_id, [])
     if not items:
@@ -106,15 +168,14 @@ def format_cart(user_id: int) -> str:
         sum_ = p.price * it["qty"]
         total += sum_
         lines.append(
-            f"{idx}) {p.name}\n"
-            f"   Размер: {it['size']} | Кол-во: {it['qty']} | {sum_:,} сум".replace(",", " ")
+            f"{idx}) {p.name}\n   Размер: {it['size']} | Кол-во: {it['qty']} | {sum_:,} сум".replace(",", " ")
         )
     lines.append(f"\n*Итого:* {total:,} сум".replace(",", " "))
     return "\n".join(lines)
 
 def get_selected_size(user_id: int, product_id: str) -> int:
-    state = checkout_state.get(user_id, {})
-    selected = state.get("selected_sizes", {})
+    st = checkout_state.get(user_id, {})
+    selected = st.get("selected_sizes", {})
     return int(selected.get(product_id, 17))
 
 def set_selected_size(user_id: int, product_id: str, size: int):
@@ -130,33 +191,6 @@ def add_to_cart(user_id: int, product_id: str):
             it["qty"] += 1
             return
     items.append({"product_id": product_id, "size": size, "qty": 1})
-
-def normalize_phone(s: str) -> str:
-    # минимальная нормализация: оставим + и цифры
-    s = s.strip()
-    out = []
-    for ch in s:
-        if ch.isdigit() or ch == "+":
-            out.append(ch)
-    return "".join(out)
-
-def is_phone_ok(s: str) -> bool:
-    # простая проверка: +998XXXXXXXXX или просто >= 9 цифр
-    digits = "".join(ch for ch in s if ch.isdigit())
-    return len(digits) >= 9
-
-def make_contact_links(uid: int, username: Optional[str]) -> List[str]:
-    links = []
-    # 1) Надёжно для Telegram Desktop
-    links.append(f"tg://user?id={uid}")
-
-    # 2) Если есть username — нормальная web ссылка
-    if username:
-        links.append(f"https://t.me/{username}")
-
-    # 3) Иногда кликается в некоторых клиентах как fallback
-    links.append(f"https://t.me/user?id={uid}")
-    return links
 
 # ====== BOT ======
 bot = Bot(BOT_TOKEN)
@@ -175,26 +209,34 @@ async def cancel(m: Message):
     uid = m.from_user.id
     if uid in checkout_state:
         checkout_state.pop(uid, None)
-        await m.answer("Оформление отменено.", reply_markup=main_menu_kb())
+        await m.answer("❌ Оформление заказа отменено.", reply_markup=main_menu_kb())
     else:
         await m.answer("Сейчас нет активного оформления.", reply_markup=main_menu_kb())
 
 @dp.message(F.text == "🛍 Каталог")
 async def show_catalog(m: Message):
-    await m.answer("🛍 *Каталог колец:*", reply_markup=catalog_kb(), parse_mode="Markdown")
+    await m.answer("🛍 *Каталог:*", reply_markup=catalog_kb(), parse_mode="Markdown")
 
 @dp.message(F.text == "💬 Связаться")
 async def contact(m: Message):
-    await m.answer("💬 Напишите сюда: @dunya_jewellryad\nКанал: https://t.me/dunya_jewellry")
+    text = f"💬 Менеджер: @{MANAGER_USERNAME}"
+    if MANAGER_PHONE:
+        text += f"\n📞 Телефон: {MANAGER_PHONE}"
+    await m.answer(text, reply_markup=contact_kb(), disable_web_page_preview=True)
 
 @dp.message(F.text == "🧺 Корзина")
 async def show_cart(m: Message):
     text = format_cart(m.from_user.id)
     await m.answer(text, reply_markup=cart_kb(m.from_user.id), parse_mode="Markdown")
 
+@dp.callback_query(F.data == "go:catalog")
+async def go_catalog(c: CallbackQuery):
+    await c.message.answer("🛍 *Каталог:*", reply_markup=catalog_kb(), parse_mode="Markdown")
+    await c.answer()
+
 @dp.callback_query(F.data == "back:catalog")
 async def back_catalog(c: CallbackQuery):
-    await c.message.edit_text("🛍 *Каталог колец:*", reply_markup=catalog_kb(), parse_mode="Markdown")
+    await c.message.edit_text("🛍 *Каталог:*", reply_markup=catalog_kb(), parse_mode="Markdown")
     await c.answer()
 
 @dp.callback_query(F.data.startswith("p:"))
@@ -258,7 +300,7 @@ async def del_item(c: CallbackQuery):
     await c.message.edit_text(format_cart(c.from_user.id), reply_markup=cart_kb(c.from_user.id), parse_mode="Markdown")
     await c.answer()
 
-# ====== Оформление заказа ======
+# ====== ОФОРМЛЕНИЕ ======
 @dp.callback_query(F.data == "checkout:start")
 async def checkout_start(c: CallbackQuery):
     uid = c.from_user.id
@@ -281,38 +323,44 @@ async def checkout_flow(m: Message):
         return
 
     text = (m.text or "").strip()
-    step = st["step"]
-    data = st["data"]
-
-    # не даём кнопкам ломать оформление
-    if text in ("🛍 Каталог", "🧺 Корзина", "💬 Связаться"):
-        await m.answer("Сейчас идёт оформление заказа. Напишите ответ текстом.\n(отмена: /cancel)")
-        return
-
     if not text:
         await m.answer("Пусто. Введите значение ещё раз.")
         return
 
+    if text in ("🛍 Каталог", "🧺 Корзина", "💬 Связаться"):
+        step = st["step"]
+        prompt = {
+            "name": "Введите *имя*:\n(для отмены: /cancel)",
+            "phone": "Введите *телефон* (например +998901234567):\n(для отмены: /cancel)",
+            "address": "Введите *адрес доставки*:\n(для отмены: /cancel)",
+            "comment": "Комментарий (если нет — напишите `-`):\n(для отмены: /cancel)",
+        }[step]
+        await m.answer(prompt, parse_mode="Markdown")
+        return
+
+    step = st["step"]
+    data = st["data"]
+
     if step == "name":
         data["name"] = text
         st["step"] = "phone"
-        await m.answer("Введите *телефон* (например +998901234567):", parse_mode="Markdown")
+        await m.answer("Введите *телефон* (например +998901234567):\n(для отмены: /cancel)", parse_mode="Markdown")
         return
 
     if step == "phone":
-        phone = normalize_phone(text)
-        if not is_phone_ok(phone):
-            await m.answer("Телефон выглядит неверно. Введите ещё раз (например +998901234567).")
+        normalized = normalize_phone(text)
+        if not normalized:
+            await m.answer("Телефон неверный. Пример: +998901234567\nВведите телефон ещё раз:")
             return
-        data["phone"] = phone
+        data["phone"] = normalized
         st["step"] = "address"
-        await m.answer("Введите *адрес доставки*:", parse_mode="Markdown")
+        await m.answer("Введите *адрес доставки*:\n(для отмены: /cancel)", parse_mode="Markdown")
         return
 
     if step == "address":
         data["address"] = text
         st["step"] = "comment"
-        await m.answer("Комментарий (если нет — напишите `-`):", parse_mode="Markdown")
+        await m.answer("Комментарий (если нет — напишите `-`):\n(для отмены: /cancel)", parse_mode="Markdown")
         return
 
     if step == "comment":
@@ -320,30 +368,50 @@ async def checkout_flow(m: Message):
 
         username = m.from_user.username
         full_name = (m.from_user.full_name or "").strip()
+        phone = data.get("phone", "")
+        uid_str = str(uid)
+        link = f"https://t.me/{username}" if username else "нет (у клиента нет username)"
 
-        links = make_contact_links(uid, username)
-
-        order_text = [
+        msg = "\n".join([
             "🧾 *Новый заказ Dunya Jewellery*",
             f"Покупатель: {data['name']}",
-            f"Телефон: {data['phone']}",
+            f"Телефон: {phone}",
             f"Адрес: {data['address']}",
             f"Комментарий: {data['comment']}",
             "",
             "👤 *Контакт клиента:*",
             f"Имя TG: {full_name}" if full_name else "Имя TG: -",
-            f"ID: `{uid}`",
+            f"ID: `{uid_str}`",
             f"Username: @{username}" if username else "Username: (нет)",
-            "Связь:",
-            *[f"- {lnk}" for lnk in links],
+            f"Ссылка: {link}",
             "",
             format_cart(uid),
-        ]
-        msg = "\n".join(order_text)
+        ])
 
-        await bot.send_message(ADMIN_CHAT_ID, msg, parse_mode="Markdown")
+        await bot.send_message(
+            ADMIN_CHAT_ID,
+            msg,
+            parse_mode="Markdown",
+            reply_markup=admin_contact_kb(username),
+            disable_web_page_preview=True,
+        )
 
-        await m.answer("✅ Заказ принят! Данные получены.", reply_markup=main_menu_kb())
+        # контакт админу — чтобы можно было звонить/писать по телефону
+        try:
+            await bot.send_contact(
+                chat_id=ADMIN_CHAT_ID,
+                phone_number=phone,
+                first_name=(data["name"][:64] if data["name"] else "Клиент"),
+                last_name="",
+            )
+        except Exception:
+            pass
+
+        # клиенту: сразу кнопка "Написать менеджеру"
+        await m.answer(
+            "✅ Заказ принят! Чтобы уточнить детали — нажмите кнопку и напишите менеджеру.",
+            reply_markup=after_order_kb(),
+        )
 
         cart[uid] = []
         checkout_state.pop(uid, None)
