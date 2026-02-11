@@ -1,13 +1,13 @@
 import os
 import asyncio
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 import json
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from dotenv import load_dotenv
 
@@ -19,14 +19,14 @@ ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 if not BOT_TOKEN or not ADMIN_CHAT_ID:
     raise SystemExit("Заполните BOT_TOKEN и ADMIN_CHAT_ID в .env")
 
-# ====== ТОВАРЫ (быстро: храним прямо в коде) ======
+# ====== ТОВАРЫ ======
 @dataclass
 class Product:
     id: str
     name: str
     price: int
     desc: str
-    photo_url: str  # можно заменить на file_id позже
+    photo_url: str
 
 DATA_FILE = Path(__file__).with_name("products.json")
 
@@ -47,7 +47,7 @@ def load_products() -> Dict[str, Product]:
 PRODUCTS: Dict[str, Product] = load_products()
 SIZES = [15, 16, 17, 18, 19]
 
-# ====== ПАМЯТЬ (быстро, без базы) ======
+# ====== ПАМЯТЬ (без базы) ======
 cart: Dict[int, List[dict]] = {}
 checkout_state: Dict[int, dict] = {}
 
@@ -62,7 +62,10 @@ def main_menu_kb():
 def catalog_kb():
     kb = InlineKeyboardBuilder()
     for p in PRODUCTS.values():
-        kb.button(text=f"{p.name} — {p.price:,} сум".replace(",", " "), callback_data=f"p:{p.id}")
+        kb.button(
+            text=f"{p.name} — {p.price:,} сум".replace(",", " "),
+            callback_data=f"p:{p.id}",
+        )
     kb.adjust(1)
     return kb.as_markup()
 
@@ -81,7 +84,6 @@ def cart_kb(user_id: int):
     kb = InlineKeyboardBuilder()
     items = cart.get(user_id, [])
     for i, it in enumerate(items):
-        p = PRODUCTS[it["product_id"]]
         kb.button(text=f"➕ {i+1}", callback_data=f"inc:{i}")
         kb.button(text=f"➖ {i+1}", callback_data=f"dec:{i}")
         kb.button(text=f"🗑 {i+1}", callback_data=f"del:{i}")
@@ -103,7 +105,10 @@ def format_cart(user_id: int) -> str:
         p = PRODUCTS[it["product_id"]]
         sum_ = p.price * it["qty"]
         total += sum_
-        lines.append(f"{idx}) {p.name}\n   Размер: {it['size']} | Кол-во: {it['qty']} | {sum_:,} сум".replace(",", " "))
+        lines.append(
+            f"{idx}) {p.name}\n"
+            f"   Размер: {it['size']} | Кол-во: {it['qty']} | {sum_:,} сум".replace(",", " ")
+        )
     lines.append(f"\n*Итого:* {total:,} сум".replace(",", " "))
     return "\n".join(lines)
 
@@ -126,6 +131,33 @@ def add_to_cart(user_id: int, product_id: str):
             return
     items.append({"product_id": product_id, "size": size, "qty": 1})
 
+def normalize_phone(s: str) -> str:
+    # минимальная нормализация: оставим + и цифры
+    s = s.strip()
+    out = []
+    for ch in s:
+        if ch.isdigit() or ch == "+":
+            out.append(ch)
+    return "".join(out)
+
+def is_phone_ok(s: str) -> bool:
+    # простая проверка: +998XXXXXXXXX или просто >= 9 цифр
+    digits = "".join(ch for ch in s if ch.isdigit())
+    return len(digits) >= 9
+
+def make_contact_links(uid: int, username: Optional[str]) -> List[str]:
+    links = []
+    # 1) Надёжно для Telegram Desktop
+    links.append(f"tg://user?id={uid}")
+
+    # 2) Если есть username — нормальная web ссылка
+    if username:
+        links.append(f"https://t.me/{username}")
+
+    # 3) Иногда кликается в некоторых клиентах как fallback
+    links.append(f"https://t.me/user?id={uid}")
+    return links
+
 # ====== BOT ======
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
@@ -138,13 +170,21 @@ async def start(m: Message):
         parse_mode="Markdown",
     )
 
+@dp.message(Command("cancel"))
+async def cancel(m: Message):
+    uid = m.from_user.id
+    if uid in checkout_state:
+        checkout_state.pop(uid, None)
+        await m.answer("Оформление отменено.", reply_markup=main_menu_kb())
+    else:
+        await m.answer("Сейчас нет активного оформления.", reply_markup=main_menu_kb())
+
 @dp.message(F.text == "🛍 Каталог")
 async def show_catalog(m: Message):
     await m.answer("🛍 *Каталог колец:*", reply_markup=catalog_kb(), parse_mode="Markdown")
 
 @dp.message(F.text == "💬 Связаться")
 async def contact(m: Message):
-    # УБРАЛ @ из ссылки
     await m.answer("💬 Напишите сюда: @dunya_jewellryad\nКанал: https://t.me/dunya_jewellry")
 
 @dp.message(F.text == "🧺 Корзина")
@@ -221,23 +261,17 @@ async def del_item(c: CallbackQuery):
 # ====== Оформление заказа ======
 @dp.callback_query(F.data == "checkout:start")
 async def checkout_start(c: CallbackQuery):
-    if not cart.get(c.from_user.id):
+    uid = c.from_user.id
+    if not cart.get(uid):
         await c.answer("Корзина пустая.")
         return
-    # не трогаем selected_sizes, чтобы выбор размера не ломался
-    prev = checkout_state.get(c.from_user.id, {})
+
+    prev = checkout_state.get(uid, {})
     selected_sizes = prev.get("selected_sizes", {})
-    checkout_state[c.from_user.id] = {"step": "name", "data": {}, "selected_sizes": selected_sizes}
+    checkout_state[uid] = {"step": "name", "data": {}, "selected_sizes": selected_sizes}
 
-    await bot.send_message(c.from_user.id, "Введите *имя*:", parse_mode="Markdown")
+    await bot.send_message(uid, "Введите *имя*:\n(для отмены: /cancel)", parse_mode="Markdown")
     await c.answer()
-
-def make_contact_link(uid: int, username: str | None) -> str:
-    # Если username есть — лучше https://t.me/username
-    # Если нет — tg://user?id=uid (работает в Telegram Desktop)
-    if username:
-        return f"https://t.me/{username}"
-    return f"tg://user?id={uid}"
 
 @dp.message()
 async def checkout_flow(m: Message):
@@ -250,23 +284,27 @@ async def checkout_flow(m: Message):
     step = st["step"]
     data = st["data"]
 
-    # защита от пустого ввода
+    # не даём кнопкам ломать оформление
+    if text in ("🛍 Каталог", "🧺 Корзина", "💬 Связаться"):
+        await m.answer("Сейчас идёт оформление заказа. Напишите ответ текстом.\n(отмена: /cancel)")
+        return
+
     if not text:
         await m.answer("Пусто. Введите значение ещё раз.")
         return
 
     if step == "name":
-        # если юзер случайно нажал "Каталог/Корзина" во время оформления — это мусор
-        if text in ("🛍 Каталог", "🧺 Корзина", "💬 Связаться"):
-            await m.answer("Сейчас идёт оформление заказа. Введите *имя*:", parse_mode="Markdown")
-            return
         data["name"] = text
         st["step"] = "phone"
         await m.answer("Введите *телефон* (например +998901234567):", parse_mode="Markdown")
         return
 
     if step == "phone":
-        data["phone"] = text
+        phone = normalize_phone(text)
+        if not is_phone_ok(phone):
+            await m.answer("Телефон выглядит неверно. Введите ещё раз (например +998901234567).")
+            return
+        data["phone"] = phone
         st["step"] = "address"
         await m.answer("Введите *адрес доставки*:", parse_mode="Markdown")
         return
@@ -282,7 +320,8 @@ async def checkout_flow(m: Message):
 
         username = m.from_user.username
         full_name = (m.from_user.full_name or "").strip()
-        link = make_contact_link(uid, username)
+
+        links = make_contact_links(uid, username)
 
         order_text = [
             "🧾 *Новый заказ Dunya Jewellery*",
@@ -295,7 +334,8 @@ async def checkout_flow(m: Message):
             f"Имя TG: {full_name}" if full_name else "Имя TG: -",
             f"ID: `{uid}`",
             f"Username: @{username}" if username else "Username: (нет)",
-            f"Связь: {link}",
+            "Связь:",
+            *[f"- {lnk}" for lnk in links],
             "",
             format_cart(uid),
         ]
@@ -303,7 +343,6 @@ async def checkout_flow(m: Message):
 
         await bot.send_message(ADMIN_CHAT_ID, msg, parse_mode="Markdown")
 
-        # НЕ обещаем "мы свяжемся" — вы сами связываетесь
         await m.answer("✅ Заказ принят! Данные получены.", reply_markup=main_menu_kb())
 
         cart[uid] = []
